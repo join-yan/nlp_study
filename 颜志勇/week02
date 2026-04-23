@@ -1,1 +1,185 @@
 
+import torch
+import torch.nn as nn
+import numpy as np
+import random
+import json
+import matplotlib.pyplot as plt
+
+"""
+基于pytorch框架编写模型训练
+实现一个自行构造的找规律(机器学习)任务
+规律：x是一个5维向量，找出其中最大的数所在的位置，属于5分类问题
+"""
+
+class TorchModel(nn.Module):
+    def __init__(self, input_size, output_size=5):
+        super(TorchModel, self).__init__()
+        # 修改1: 输出维度改为5（5个类别），不再使用sigmoid
+        self.linear = nn.Linear(input_size, output_size)
+        # 修改2: 交叉熵损失函数内部包含了softmax，不需要额外激活
+        self.loss = nn.CrossEntropyLoss()
+
+    def forward(self, x, y=None):
+        # 输出shape: (batch_size, 5)，表示每个类别的logits
+        logits = self.linear(x)
+        # print(f"Logits: {logits}")
+        
+        if y is not None:
+            # 修改3: y需要是LongTensor类型，shape为(batch_size,)
+            # 交叉熵要求: 预测值(batch, classes), 标签(batch,)
+            return self.loss(logits, y)
+        else:
+            # 预测时返回概率最大的类别
+            return torch.argmax(logits, dim=1)
+
+# 生成一个样本: 返回5维向量和最大值的位置索引(0-4)
+def build_sample():
+    x = np.random.random(5)
+    max_index = np.argmax(x)  # 直接返回0-4的整数
+    return x, max_index
+
+# 生成一批样本
+def build_dataset(total_sample_num):
+    X = []
+    Y = []
+    for i in range(total_sample_num):
+        x, y = build_sample()
+        X.append(x)
+        Y.append(y)  # 修改4: 直接存储整数标签，不需要包装成列表
+    
+    # 修改5: Y需要是LongTensor类型，用于交叉熵损失
+    return torch.FloatTensor(X), torch.LongTensor(Y)
+
+# 评估模型准确率
+def evaluate(model):
+    model.eval()
+    test_sample_num = 100
+    x, y = build_dataset(test_sample_num)
+    
+    correct = 0
+    with torch.no_grad():
+        logits = model.linear(x)  # 获取logits用于计算准确率
+        y_pred = torch.argmax(logits, dim=1)  # 预测类别
+        
+        # 计算正确数
+        correct = (y_pred == y).sum().item()
+    
+    accuracy = correct / test_sample_num
+    print(f"正确预测个数：{correct}/{test_sample_num}, 正确率：{accuracy:.4f}")
+    
+    # 打印几个样本示例
+    print("\n示例预测结果（前5个）：")
+    for i in range(min(5, len(x))):
+        print(f"  输入: {x[i].tolist()}, 最大值位置: {y[i]}, 预测位置: {y_pred[i]}")
+    
+    return accuracy
+
+def main():
+    # 配置参数
+    epoch_num = 50  # 增加训练轮数
+    batch_size = 32
+    train_sample = 5000
+    input_size = 5
+    output_size = 5  # 5分类
+    learning_rate = 0.01
+    
+    # 建立模型
+    model = TorchModel(input_size, output_size)
+    optim = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # 创建训练集
+    train_x, train_y = build_dataset(train_sample)
+    
+    log = []
+    
+    # 训练过程
+    for epoch in range(epoch_num):
+        model.train()
+        watch_loss = []
+        
+        # 使用DataLoader方式更优雅，这里保持简单但修正batch循环
+        for batch_index in range(0, train_sample, batch_size):
+            # 取出batch数据
+            end_idx = min(batch_index + batch_size, train_sample)
+            x = train_x[batch_index:end_idx]
+            y = train_y[batch_index:end_idx]
+            
+            # 前向传播计算loss
+            loss = model(x, y)
+            
+            # 反向传播
+            loss.backward()
+            optim.step()
+            optim.zero_grad()
+            
+            watch_loss.append(loss.item())
+        
+        avg_loss = np.mean(watch_loss)
+        print(f"\n第{epoch + 1}轮平均loss: {avg_loss:.6f}")
+        
+        # 每5轮评估一次
+        if (epoch + 1) % 5 == 0:
+            acc = evaluate(model)
+            log.append([acc, avg_loss])
+    
+    # 保存模型
+    torch.save(model.state_dict(), "model.pt")
+    
+    # 画图
+    if log:
+        plt.figure(figsize=(10, 4))
+        plt.subplot(1, 2, 1)
+        plt.plot(range(len(log)), [l[0] for l in log], label="accuracy", marker='o')
+        plt.xlabel("Evaluation Epoch (x5)")
+        plt.ylabel("Accuracy")
+        plt.legend()
+        plt.subplot(1, 2, 2)
+        plt.plot(range(len(log)), [l[1] for l in log], label="loss", marker='o', color='orange')
+        plt.xlabel("Evaluation Epoch (x5)")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    
+    # 最终评估
+    print("\n最终模型评估：")
+    final_acc = evaluate(model)
+    print(f"最终准确率: {final_acc:.4f}")
+
+# 使用训练好的模型做预测
+def predict(model_path, input_vec):
+    input_size = 5
+    output_size = 5
+    model = TorchModel(input_size, output_size)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    
+    with torch.no_grad():
+        logits = model.linear(torch.FloatTensor(input_vec))
+        predictions = torch.argmax(logits, dim=1)
+        
+    print("\n预测结果：")
+    for vec, pred in zip(input_vec, predictions):
+        max_val = max(vec)
+        max_pos = np.argmax(vec)
+        print(f"输入: {vec}")
+        print(f"  真实最大值位置: {max_pos} (值: {max_val:.4f})")
+        print(f"  模型预测位置: {pred.item()}")
+        print(f"  预测{'正确' if pred == max_pos else '错误'}")
+        print()
+
+if __name__ == "__main__":
+    main()
+    
+    # 测试预测
+    print("\n" + "="*50)
+    print("测试预测功能：")
+    test_vecs = [
+        [0.8, 0.2, 0.1, 0.1, 0.1],  # 最大值在第0位
+        [0.1, 0.9, 0.1, 0.1, 0.1],  # 最大值在第1位
+        [0.1, 0.1, 0.7, 0.1, 0.1],  # 最大值在第2位
+        [0.2, 0.1, 0.1, 0.8, 0.1],  # 最大值在第3位
+        [0.1, 0.1, 0.1, 0.2, 0.9],  # 最大值在第4位
+    ]
+    predict("model.pt", test_vecs)
