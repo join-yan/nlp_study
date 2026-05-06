@@ -1,0 +1,352 @@
+import random
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+
+#————————————超参数——————————————
+SEED = 50
+N_SAMPLES = 6000  # 增加样本数，6分类需要更多数据
+MAXLEN = 32
+EMBEDDING_DIM = 64
+HIDDEN_DIM = 64
+LR = 1e-3
+BATCH_SIZE = 64
+EPOCHS = 30  # 增加训练轮数
+TRAIN_RATIO = 0.8
+
+#————————————数据准备——————————————
+random.seed(SEED)
+torch.manual_seed(SEED)
+
+# 定义6个类别及其关键词
+CLASSES = {
+    0: {'name': '类别0_积极', 'keywords': ['好', '棒', '赞']},
+    1: {'name': '类别1_消极', 'keywords': ['差', '坏', '糟']},
+    2: {'name': '类别2_中性', 'keywords': ['一般', '普通', '平常']},
+    3: {'name': '类别3_疑问', 'keywords': ['吗', '呢', '？']},
+    4: {'name': '类别4_感叹', 'keywords': ['啊', '呀', '哇']},
+    5: {'name': '类别5_否定', 'keywords': ['不', '没', '无']}
+}
+
+# 不同类别的模板
+TEMPLATES = {
+    0: [  # 积极类
+        '这家{}真的很{}',
+        '这款{}让我{}',
+        '{}的服务{}极了',
+        '体验非常{}',
+        '感觉{}满意',
+    ],
+    1: [  # 消极类
+        '这家{}真的{}',
+        '这款{}让我{}',
+        '{}的服务{}透了',
+        '体验非常{}',
+        '感觉{}失望',
+    ],
+    2: [  # 中性类
+        '今天天气{}',
+        '这个产品{}',
+        '{}的服务{}',
+        '感觉{}一般',
+        '{}比较普通',
+    ],
+    3: [  # 疑问类
+        '你{}吗',
+        '这个{}呢',
+        '{}怎么样',
+        '{}好不好',
+        '真的{}吗',
+    ],
+    4: [  # 感叹类
+        '太{}了啊',
+        '真{}呀',
+        '好{}哇',
+        '{}极了',
+        '{}死了',
+    ],
+    5: [  # 否定类
+        '{}不{}',
+        '没有{}',
+        '{}不行',
+        '{}不好',
+        '无法{}',
+    ]
+}
+
+OBJ_WORDS = ['店铺', '餐厅', '产品', '服务', '环境', '系统', '设计', '课程']
+ADJ_WORDS = ['方便', '简洁', '独特', '舒适', '高效', '糟糕', '麻烦']
+
+
+def generate_sample(class_id):
+    """生成指定类别的样本"""
+    keywords = CLASSES[class_id]['keywords']
+    kw = random.choice(keywords)
+    tmpl = random.choice(TEMPLATES[class_id])
+    obj = random.choice(OBJ_WORDS)
+    adj = random.choice(ADJ_WORDS)
+    
+    try:
+        # 根据模板的占位符数量决定参数
+        if tmpl.count('{}') == 2:
+            sent = tmpl.format(obj, kw)
+        elif tmpl.count('{}') == 1:
+            if '{}' in tmpl:
+                # 随机选择用obj还是kw填充
+                if random.random() > 0.5:
+                    sent = tmpl.format(obj)
+                else:
+                    sent = tmpl.format(kw)
+            else:
+                sent = tmpl
+        else:
+            sent = tmpl
+    except Exception:
+        # 备用生成逻辑
+        sent = obj + kw + adj
+    
+    # 数据增强：随机插入类别关键词
+    if random.random() < 0.3:
+        extra = random.choice(keywords)
+        pos = random.randint(0, len(sent))
+        sent = sent[:pos] + extra + sent[pos:]
+    
+    return sent, class_id
+
+
+def build_dataset(n=N_SAMPLES):
+    """构建6分类数据集，保证每个类别均衡"""
+    data = []
+    samples_per_class = n // 6  # 每个类别样本数
+    
+    for class_id in range(6):
+        for _ in range(samples_per_class):
+            data.append(generate_sample(class_id))
+    
+    # 补齐可能因为整除问题剩余的样本
+    remaining = n - len(data)
+    for _ in range(remaining):
+        class_id = random.randint(0, 5)
+        data.append(generate_sample(class_id))
+    
+    random.shuffle(data)
+    return data
+
+
+#————————————词表准备——————————————
+def build_vocab(data):
+    """构建字符级词表"""
+    vocab = {'<PAD>': 0, '<UNK>': 1}
+    for sent, _ in data:
+        for ch in sent:
+            if ch not in vocab:
+                vocab[ch] = len(vocab)
+    return vocab
+
+
+def encode(sent, vocab, maxlen=MAXLEN):
+    """将句子编码为ID序列"""
+    ids = [vocab.get(ch, vocab['<UNK>']) for ch in sent]
+    if len(ids) < maxlen:
+        ids += [vocab['<PAD>']] * (maxlen - len(ids))
+    else:
+        ids = ids[:maxlen]
+    return ids
+
+
+class TextDataset(Dataset):
+    """文本数据集类（6分类版本）"""
+    def __init__(self, data, vocab):
+        self.X = [encode(s, vocab) for s, _ in data]
+        self.y = [lb for _, lb in data]
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, i):
+        return (
+            torch.tensor(self.X[i], dtype=torch.long),
+            torch.tensor(self.y[i], dtype=torch.long),  # 标签0-5
+        )
+
+
+class KeywordRNN(nn.Module):
+    """RNN文本分类模型（6分类）"""
+    
+    def __init__(self, vocab_size, num_classes=6, embed_dim=EMBEDDING_DIM, 
+                 hidden_dim=HIDDEN_DIM, dropout=0.3):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.rnn = nn.RNN(embed_dim, hidden_dim, batch_first=True)
+        self.bn = nn.BatchNorm1d(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim, num_classes)  # 输出6个类别
+    
+    def forward(self, x):
+        # x: (batch, seq_len)
+        embedded = self.embedding(x)  # (B, L, embed_dim)
+        rnn_out, _ = self.rnn(embedded)  # (B, L, hidden_dim)
+        pooled = rnn_out.max(dim=1)[0]  # (B, hidden_dim) max pooling
+        pooled = self.dropout(self.bn(pooled))
+        logits = self.fc(pooled)  # (B, 6) 返回logits
+        return logits
+
+
+#————————————训练与评估——————————————
+def evaluate(model, loader):
+    """评估模型准确率（6分类）"""
+    model.eval()
+    correct = 0
+    total = 0
+    # 可选：统计每个类别的准确率
+    class_correct = [0] * 6
+    class_total = [0] * 6
+    
+    with torch.no_grad():
+        for X, y in loader:
+            logits = model(X)  # (B, 6)
+            pred = torch.argmax(logits, dim=1)  # 预测的类别索引
+            correct += (pred == y).sum().item()
+            total += len(y)
+            
+            # 统计每个类别的准确率
+            for i in range(len(y)):
+                label = y[i].item()
+                class_total[label] += 1
+                if pred[i] == y[i]:
+                    class_correct[label] += 1
+    
+    accuracy = correct / total
+    class_acc = {i: class_correct[i]/class_total[i] if class_total[i]>0 else 0 
+                 for i in range(6)}
+    
+    return accuracy, class_acc
+
+
+def train():
+    print("生成6分类数据集...")
+    data = build_dataset(N_SAMPLES)
+    print(f"数据集大小: {len(data)}")
+    
+    # 统计每个类别的数量
+    class_counts = [0] * 6
+    for _, label in data:
+        class_counts[label] += 1
+    for i in range(6):
+        print(f"  类别{i}({CLASSES[i]['name']}): {class_counts[i]}个样本")
+    
+    # 构建词表
+    vocab = build_vocab(data)
+    print(f"词表大小：{len(vocab)}")
+    
+    # 划分训练集和验证集
+    split = int(len(data) * TRAIN_RATIO)
+    train_data = data[:split]
+    val_data = data[split:]
+    
+    print(f"训练集大小: {len(train_data)}")
+    print(f"验证集大小: {len(val_data)}")
+    
+    # 创建DataLoader
+    train_dataset = TextDataset(train_data, vocab)
+    val_dataset = TextDataset(val_data, vocab)
+    
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+    
+    # 创建模型
+    model = KeywordRNN(vocab_size=len(vocab), num_classes=6)
+    criterion = nn.CrossEntropyLoss()  # 多分类交叉熵损失
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    
+    # 学习率调度器（可选）
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    
+    # 打印模型信息
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"模型参数量：{total_params:,}\n")
+    
+    best_val_acc = 0.0
+    best_model_state = None
+    
+    # 训练循环
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
+        
+        for X, y in train_loader:
+            # 前向传播
+            logits = model(X)
+            loss = criterion(logits, y)
+            
+            # 反向传播
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        # 验证
+        avg_loss = total_loss / len(train_loader)
+        val_acc, class_acc = evaluate(model, val_loader)
+        
+        # 调整学习率
+        scheduler.step()
+        
+        # 保存最佳模型
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = model.state_dict().copy()
+        
+        # 打印训练信息
+        if epoch % 5 == 0 or epoch == 1:
+            print(f"\nEpoch {epoch:2d}/{EPOCHS}")
+            print(f"  损失: {avg_loss:.4f}")
+            print(f"  验证准确率: {val_acc:.4f}")
+            print(f"  各类别准确率:")
+            for i in range(6):
+                print(f"    类别{i}({CLASSES[i]['name']}): {class_acc[i]:.4f}")
+        else:
+            print(f"Epoch {epoch:2d}/{EPOCHS}  loss={avg_loss:.4f}  val_acc={val_acc:.4f}")
+    
+    # 加载最佳模型
+    model.load_state_dict(best_model_state)
+    final_acc, final_class_acc = evaluate(model, val_loader)
+    print(f"\n最佳验证准确率：{best_val_acc:.4f}")
+    print(f"\n最终各类别准确率:")
+    for i in range(6):
+        print(f"  类别{i}({CLASSES[i]['name']}): {final_class_acc[i]:.4f}")
+    
+    # 推理示例
+    print("\n--- 推理示例 ---")
+    model.eval()
+    test_sents = [
+        '这家店铺真的很棒',        # 期望: 类别0(积极)
+        '服务太糟糕了',            # 期望: 类别1(消极)
+        '这个产品比较普通',        # 期望: 类别2(中性)
+        '你吃饭了吗',              # 期望: 类别3(疑问)
+        '太美了啊',                # 期望: 类别4(感叹)
+        '这个不行',                # 期望: 类别5(否定)
+        '我非常喜欢这个设计',      # 混合测试
+        '为什么这么差',            # 混合测试
+    ]
+    
+    with torch.no_grad():
+        for sent in test_sents:
+            ids = torch.tensor([encode(sent, vocab)], dtype=torch.long)
+            logits = model(ids)
+            probs = torch.softmax(logits, dim=1)  # 转换为概率
+            pred_class = torch.argmax(logits, dim=1).item()
+            confidence = probs[0][pred_class].item()
+            
+            print(f"\n句子: {sent}")
+            print(f"  预测类别: {pred_class}({CLASSES[pred_class]['name']})")
+            print(f"  置信度: {confidence:.4f}")
+            print(f"  各类别概率:", end=" ")
+            for i in range(6):
+                print(f"{i}:{probs[0][i]:.3f}", end="  ")
+
+
+if __name__ == '__main__':
+    train()
